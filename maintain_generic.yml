@@ -1,0 +1,428 @@
+---
+- name: Generic maintain + health audit (one host)
+  hosts: all
+  gather_facts: true
+  become: true
+
+  vars:
+    bootstrap_key: "{{ bootstrap_key | default(false) | bool }}"
+    disk_full_percent: "{{ disk_full_percent | default(90) | int }}"
+
+    # Network test targets
+    dns_test_name: "cloudflare.com"
+    ping_fallback_ip: "1.1.1.1"
+
+    # Optional app URL check (from controller). Empty/undefined skips.
+    url: "{{ url | default('') }}"
+
+  pre_tasks:
+    - name: Confirm before processing this host
+      pause:
+        prompt: "Process {{ inventory_hostname }} now? Press Enter to continue, Ctrl+C to abort"
+
+    - name: Bootstrap our SSH key (optional)
+      when: bootstrap_key
+      block:
+        - name: Ensure ~/.ssh exists
+          file:
+            path: "~/.ssh"
+            state: directory
+            mode: "0700"
+          become: false
+
+        - name: Install our public key into authorized_keys
+          authorized_key:
+            user: "{{ ansible_user }}"
+            state: present
+            key: "{{ lookup('file', lookup('env','HOME') + '/.ssh/id_ed25519.pub') }}"
+          become: false
+
+  tasks:
+    # -------------------------
+    # UPDATES (NO dist-upgrade)
+    # -------------------------
+    - name: Debian/Ubuntu - apt update
+      when: ansible_facts.os_family == "Debian"
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Debian/Ubuntu - safe upgrade (NOT dist-upgrade)
+      when: ansible_facts.os_family == "Debian"
+      apt:
+        upgrade: safe
+        autoclean: true
+        autoremove: true
+
+    - name: RHEL/Fedora - update packages (normal updates)
+      when: ansible_facts.os_family == "RedHat"
+      package:
+        name: "*"
+        state: latest
+
+    - name: Wait for connection (in case services restart)
+      wait_for_connection:
+        timeout: 120
+
+    # -------------------------
+    # BASE HEALTH CHECKS
+    # -------------------------
+    - name: systemd failed units
+      command: systemctl --failed --no-legend
+      register: failed_units
+      changed_when: false
+      failed_when: false
+
+    - name: Disk usage (percent mountpoint)
+      shell: |
+        set -e
+        df -P | awk 'NR>1 {gsub("%","",$5); print $5 " " $6}'
+      register: disk_usage
+      changed_when: false
+
+    - name: Compute disk issues
+      set_fact:
+        disk_warn_lines: "{{ disk_usage.stdout_lines | select('match', '^(' ~ disk_full_percent|string ~ '|[9][0-9]|100) ') | list }}"
+        disk_bad: "{{ (disk_usage.stdout_lines | select('match', '^(' ~ disk_full_percent|string ~ '|[9][0-9]|100) ') | list | length) > 0 }}"
+      changed_when: false
+
+    - name: dmesg - recent error-like lines (best effort)
+      shell: |
+        set -e
+        dmesg --level=err,crit,alert,emerg 2>/dev/null | tail -n 30 || true
+      register: dmesg_err
+      changed_when: false
+      failed_when: false
+
+    # -------------------------
+    # NETWORK CHECKS
+    # -------------------------
+    - name: Default route present?
+      shell: |
+        set -e
+        ip route show default || true
+      register: default_route
+      changed_when: false
+      failed_when: false
+
+    - name: Extract default gateway (if any)
+      set_fact:
+        default_gw: "{{ (default_route.stdout | regex_search('default via ([0-9\\.]+)', '\\1')) | default('', true) }}"
+      changed_when: false
+
+    - name: DNS resolution test (getent)
+      shell: |
+        set -e
+        if command -v getent >/dev/null 2>&1; then
+          getent hosts {{ dns_test_name }} >/dev/null
+        else
+          echo "getent not installed"
+          exit 3
+        fi
+      register: dns_ok
+      changed_when: false
+      failed_when: false
+
+    - name: Ping default gateway (if present)
+      when: default_gw | length > 0
+      shell: |
+        set -e
+        ping -c 1 -W 2 {{ default_gw }} >/dev/null
+      register: ping_gw
+      changed_when: false
+      failed_when: false
+
+    - name: Ping fallback IP (if gateway ping failed or no gateway)
+      when: (default_gw | length == 0) or (ping_gw.rc | default(1) != 0)
+      shell: |
+        set -e
+        ping -c 1 -W 2 {{ ping_fallback_ip }} >/dev/null
+      register: ping_out
+      changed_when: false
+      failed_when: false
+
+    - name: Compute network issues
+      set_fact:
+        net_issue: >-
+          {{
+            (default_route.stdout | trim == "")
+            or (dns_ok.rc is defined and dns_ok.rc != 0 and dns_ok.rc != 3)
+            or (
+              (default_gw | length > 0 and (ping_gw.rc | default(1)) != 0)
+              and ((ping_out.rc | default(1)) != 0)
+            )
+            or (
+              (default_gw | length == 0)
+              and ((ping_out.rc | default(1)) != 0)
+            )
+          }}
+        net_notes: >-
+          {{
+            "default_route=" ~ (default_route.stdout | trim | default("none", true))
+            ~ "; dns_rc=" ~ (dns_ok.rc | default("n/a") | string)
+            ~ "; gw=" ~ (default_gw | default("none", true))
+            ~ "; ping_gw_rc=" ~ (ping_gw.rc | default("n/a") | string)
+            ~ "; ping_out_rc=" ~ (ping_out.rc | default("n/a") | string)
+          }}
+      changed_when: false
+
+    # -------------------------
+    # OPTIONAL URL CHECK (from controller)
+    # -------------------------
+    - name: Optional HTTP check from controller (if url provided)
+      when: url | length > 0
+      delegate_to: localhost
+      become: false
+      uri:
+        url: "{{ url }}"
+        method: GET
+        return_content: false
+        timeout: 8
+        validate_certs: false
+        status_code: [200, 301, 302, 401, 403]
+      register: http_check
+      failed_when: false
+      changed_when: false
+
+    - name: Compute http issue
+      set_fact:
+        http_issue: "{{ (url | length > 0) and ((http_check.status | default(0) | int) == 0) }}"
+      changed_when: false
+
+    # -------------------------
+    # DOCKER CHECKS (if installed)
+    # -------------------------
+    - name: Detect docker
+      command: bash -lc "command -v docker"
+      register: docker_path
+      changed_when: false
+      failed_when: false
+
+    - name: Docker service active?
+      when: docker_path.rc == 0
+      command: systemctl is-active docker
+      register: docker_active
+      changed_when: false
+      failed_when: false
+
+    - name: Any unhealthy docker containers?
+      when: docker_path.rc == 0
+      shell: |
+        set -e
+        docker ps --format '{{"{{"}}.Names{{"}}"}}|{{"{{"}}.Status{{"}}"}}' | grep -i unhealthy || true
+      register: docker_unhealthy
+      changed_when: false
+      failed_when: false
+
+    # -------------------------
+    # NVIDIA GPU CHECKS (generic)
+    # -------------------------
+    - name: Detect GPU via lspci (if available)
+      shell: |
+        set -e
+        if command -v lspci >/dev/null 2>&1; then
+          lspci -nn | grep -Ei 'vga|3d|display' || true
+        else
+          echo "lspci not installed"
+        fi
+      register: gpu_lspci
+      changed_when: false
+
+    - name: Is NVIDIA GPU present (heuristic)
+      set_fact:
+        has_nvidia_hw: "{{ (gpu_lspci.stdout | lower) is search('nvidia') }}"
+      changed_when: false
+
+    - name: Check NVIDIA device nodes
+      when: has_nvidia_hw
+      shell: |
+        set -e
+        ls -l /dev/nvidia* 2>/dev/null || true
+      register: nvidia_devs
+      changed_when: false
+      failed_when: false
+
+    - name: Check NVIDIA kernel module loaded
+      when: has_nvidia_hw
+      shell: |
+        set -e
+        lsmod | grep -E '^nvidia\b' || true
+      register: nvidia_lsmod
+      changed_when: false
+      failed_when: false
+
+    - name: Run nvidia-smi (if available)
+      when: has_nvidia_hw
+      shell: |
+        set -e
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          nvidia-smi -L
+        else
+          echo "nvidia-smi not installed"
+          exit 3
+        fi
+      register: nvidia_smi
+      changed_when: false
+      failed_when: false
+
+    - name: Evaluate GPU health
+      set_fact:
+        gpu_issue: >-
+          {{
+            has_nvidia_hw and (
+              (nvidia_smi.rc is defined and nvidia_smi.rc != 0 and nvidia_smi.rc != 3) or
+              ((nvidia_devs.stdout | trim) == "") or
+              ((nvidia_lsmod.stdout | trim) == "")
+            )
+          }}
+        gpu_notes: >-
+          {{
+            (not has_nvidia_hw) | ternary('no NVIDIA GPU detected (or lspci missing)',
+              (
+                'nvidia-smi rc=' ~ (nvidia_smi.rc | default('n/a') | string) ~
+                '; devs=' ~ ((nvidia_devs.stdout | trim) | default('none', true)) ~
+                '; module=' ~ ((nvidia_lsmod.stdout | trim) | default('none', true))
+              )
+            )
+          }}
+      changed_when: false
+
+    # -------------------------
+    # SMART CHECKS (if smartctl installed)
+    # -------------------------
+    - name: Detect smartctl
+      command: bash -lc "command -v smartctl"
+      register: smartctl_path
+      changed_when: false
+      failed_when: false
+
+    - name: List candidate disks for SMART
+      when: smartctl_path.rc == 0
+      shell: |
+        set -e
+        lsblk -dn -o NAME,TYPE | awk '$2=="disk"{print "/dev/"$1}'
+      register: smart_disks
+      changed_when: false
+      failed_when: false
+
+    - name: Run smartctl -H on each disk
+      when: smartctl_path.rc == 0
+      shell: |
+        set -e
+        smartctl -H {{ item }} 2>/dev/null | egrep -i 'SMART overall-health|SMART Health Status|PASSED|FAILED' || true
+      loop: "{{ smart_disks.stdout_lines | default([]) }}"
+      register: smart_results
+      changed_when: false
+      failed_when: false
+
+    - name: Compute SMART issues
+      set_fact:
+        smart_issue: >-
+          {{
+            smartctl_path.rc == 0 and (
+              smart_results.results | default([]) | selectattr('stdout','search','FAILED') | list | length
+            ) > 0
+          }}
+        smart_failed: >-
+          {{
+            smart_results.results | default([]) | selectattr('stdout','search','FAILED') | map(attribute='item') | list
+          }}
+      changed_when: false
+
+    # -------------------------
+    # ZFS CHECKS (if zpool exists)
+    # -------------------------
+    - name: Detect zpool
+      command: bash -lc "command -v zpool"
+      register: zpool_path
+      changed_when: false
+      failed_when: false
+
+    - name: zpool status -x
+      when: zpool_path.rc == 0
+      shell: |
+        set -e
+        zpool status -x || true
+      register: zpool_status_x
+      changed_when: false
+      failed_when: false
+
+    - name: zpool list (context)
+      when: zpool_path.rc == 0
+      shell: |
+        set -e
+        zpool list -H -o name,size,alloc,free,health 2>/dev/null || true
+      register: zpool_list
+      changed_when: false
+      failed_when: false
+
+    - name: Compute ZFS issues
+      set_fact:
+        zfs_issue: >-
+          {{
+            zpool_path.rc == 0 and (
+              (zpool_status_x.stdout | trim != "all pools are healthy")
+              and (zpool_status_x.stdout | trim != "")
+            )
+          }}
+        zfs_notes: >-
+          {{
+            (zpool_path.rc != 0) | ternary('zpool not installed',
+              ('zpool status -x: ' ~ (zpool_status_x.stdout | trim | default('n/a', true)))
+            )
+          }}
+      changed_when: false
+
+    # -------------------------
+    # FINAL EVALUATION
+    # -------------------------
+    - name: Determine host_ok
+      set_fact:
+        host_ok: >-
+          {{
+            (failed_units.stdout | trim == "")
+            and (disk_bad == false)
+            and (net_issue == false)
+            and (http_issue == false)
+            and (gpu_issue == false)
+            and (smart_issue == false)
+            and (zfs_issue == false)
+            and (
+              (docker_path.rc != 0)
+              or (docker_active.stdout | default('inactive') == 'active')
+            )
+            and (
+              (docker_path.rc != 0)
+              or ((docker_unhealthy.stdout | trim) == "")
+            )
+          }}
+
+    - name: Report summary
+      debug:
+        msg:
+          - "OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }} ({{ ansible_facts.os_family }})"
+          - "systemd failed units: {{ failed_units.stdout | trim | default('none', true) }}"
+          - "disk warnings (>= {{ disk_full_percent }}%): {{ disk_warn_lines | default([]) }}"
+          - "network: {{ net_notes }} (issue={{ net_issue }})"
+          - "http url: {{ url | default('<none>') }} (issue={{ http_issue }})"
+          - "dmesg errors (tail): {{ (dmesg_err.stdout_lines | default([])) }}"
+          - "docker installed: {{ docker_path.rc == 0 }}"
+          - "docker active: {{ docker_active.stdout | default('n/a') }}"
+          - "docker unhealthy: {{ docker_unhealthy.stdout_lines | default([]) }}"
+          - "GPU: {{ gpu_notes }} (issue={{ gpu_issue }})"
+          - "SMART installed: {{ smartctl_path.rc == 0 }}"
+          - "SMART failed disks: {{ smart_failed | default([]) }} (issue={{ smart_issue }})"
+          - "ZFS: {{ zfs_notes }} (issue={{ zfs_issue }})"
+          - "zpool list: {{ zpool_list.stdout_lines | default([]) }}"
+          - "Host OK? {{ host_ok }}"
+
+    - name: Success message
+      when: host_ok | bool
+      debug:
+        msg: "hurray you didnt break anything...yet"
+
+    - name: Fail if not healthy
+      when: not (host_ok | bool)
+      fail:
+        msg: "Host FAILED generic checks (see report summary above)."
+

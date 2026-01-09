@@ -1,0 +1,25 @@
+targets:
+  - name: Jellyfin
+    host: # IP 
+    port: 22
+    user: root
+    url: "http://#####"
+
+  - name: HomeAssistant
+    host: # IP
+    port: 22
+    user: root
+    url: "http://"
+
+  - name: Ollama
+    host: # IP
+    port: 22
+    user: root
+    url: "http://"
+
+  - name: Nextcloud
+    host: # IP
+    port: 22
+    user: root
+    url: "http://"
+
